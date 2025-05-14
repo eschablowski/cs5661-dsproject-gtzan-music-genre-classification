@@ -3,56 +3,60 @@
 
 import keras
 import keras_tuner
-from preprocess import HyperPreprocessingLayer
+from preprocess import MultiSpectral, SimplifiedSTFT
 
 from Logger import TensorBoard as ConfusionMatrixCallback
 
+
+image_models = {
+    "MobileNet": keras.applications.MobileNet,
+    "ResNet50": keras.applications.ResNet50,
+    "ResNet50V2": keras.applications.ResNet50V2,
+    "ResNet101": keras.applications.ResNet101,
+    "ResNet101V2": keras.applications.ResNet101V2
+}
 
 def PretrainedModel(hp: keras_tuner.HyperParameters, SAMPLE_RATE: int, input_shape: tuple = (None,)):
     """
     A custom Keras model for audio classification.
     """
     image_model = hp.Choice(
-        "image_model", ["MobileNet", "ResNet50", "ResNet101", "ResNet50V2", "ResNet101V2"])
+        "image_model", list(image_models.keys()))
+    
+    image_size = (224, 224)
 
-    if image_model == "MobileNet":
-        image_model = keras.applications.MobileNetV2(
+    if image_model in list(image_models.keys()):
+        image_model = image_models[image_model](
             include_top=False,
-            input_shape=(None, None, 3),
-            pooling="max",
-        )
-    elif image_model == "ResNet50":
-        image_model = keras.applications.ResNet50(
-            include_top=False,
-            input_shape=(None, None, 3),
-            pooling="max",
-        )
-    elif image_model == "ResNet50V2":
-        image_model = keras.applications.ResNet50V2(
-            include_top=False,
-            input_shape=(None, None, 3),
-            pooling="max",
-        )
-    elif image_model == "ResNet101":
-        image_model = keras.applications.ResNet101(
-            include_top=False,
-            input_shape=(None, None, 3),
-            pooling="max",
-        )
-    elif image_model == "ResNet101V2":
-        image_model = keras.applications.ResNet101V2(
-            include_top=False,
-            input_shape=(None, None, 3),
+            input_shape=image_size + (3, ),
             pooling="max",
         )
     else:
         raise ValueError(f"Unknown image model: {image_model}")
 
-    preprocessing_layer = HyperPreprocessingLayer(hp, SAMPLE_RATE)
-
-    hidden_size = hp.Int("hidden_size", 128, 512, step=64)
-
     input = keras.layers.Input(input_shape, name="input")
+    
+    spectrograms = {}
+    for c in ["R", "G", "B"]:
+        type = hp.Choice(f"Spectrogram_{c}", ["Mel", "STFT"])
+        if type == "Mel":
+            with hp.conditional_scope(f"Spectrogram_{c}", "Mel"):
+                n_mel_bins = hp.Int(f"{c}_mel_bins", 96, 512, sampling="log", default=256)
+                spectrograms[c] = keras.layers.MelSpectrogram(sampling_rate=SAMPLE_RATE, num_mel_bins=n_mel_bins)
+        elif type == "STFT":
+            with hp.conditional_scope(f"Spectrogram_{c}", "STFT"):
+                frame_length = hp.Int(f"{c}_frame_length", 10, 250, 10, default=50)
+                frame_step = hp.Int(f"{c}_frame_step", 10, 100, step=5, default=20)
+                if frame_step > frame_length:
+                    frame_step = frame_length
+                spectrograms[c] = SimplifiedSTFT(
+                    mode="log",
+                    frame_length=frame_length * SAMPLE_RATE // 1000,
+                    frame_step=frame_step * SAMPLE_RATE // 1000
+                )
+    
+    preprocessing_layer = MultiSpectral(spectrograms.values(), image_size, name="Preprocessing_Layer")
+    
 
     with keras.RematScope(
         # This is a custom scope to allow for the use of Keras' `Remat` feature
@@ -62,16 +66,11 @@ def PretrainedModel(hp: keras_tuner.HyperParameters, SAMPLE_RATE: int, input_sha
         output_size_threshold=1024 ** 4,
     ):
         x = preprocessing_layer(input)
-        x = keras.layers.Resizing(
-            height=224,
-            width=224,
-            interpolation="bilinear",
-            name="Resizing",
-        )(x) # Resizing to 224x224, the input size for most pretrained models
     # x = keras.layers.Reshape((None, None, 3))(x)
     x = image_model(x)
 
     hidden_layer_count = hp.Int("hidden_layers", 1, 3, step=1, default=1)
+    hidden_size = hp.Int("hidden_size", 128, 512, step=64)
     pipeline = keras.layers.Pipeline([
         keras.layers.Flatten(),
         keras.layers.Dropout(rate=0.5),
@@ -88,16 +87,7 @@ def PretrainedModel(hp: keras_tuner.HyperParameters, SAMPLE_RATE: int, input_sha
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"]
     )
-
-    # return keras.models.Sequential([
-    #     preprocessing_layer,
-    #     image_model,
-    #     keras.layers.GlobalAveragePooling2D(),
-    #     keras.layers.Dropout(rate=0.5),
-    #     keras.layers.Dense(units=hidden_size, activation="relu"),
-    #     keras.layers.Dense(units=hidden_size, activation="relu"),
-    #     keras.layers.Dense(units=10, activation="softmax"),
-    # ], name="Pretrained_Model_Pipeline")
+    model.preprocessing_layer = preprocessing_layer
 
     return model
 
