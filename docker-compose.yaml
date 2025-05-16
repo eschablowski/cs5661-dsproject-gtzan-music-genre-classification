@@ -9,6 +9,7 @@ services:
       - cs5661-data:/preprocessed_data
     deploy:
       replicas: 1
+      mode: replicated-job
     restart: no
   train:
     build:
@@ -20,8 +21,11 @@ services:
       - cs5661-hp_tuning:/workspace/hyper_parameter_tuning
       - cs5661-logs:/workspace/logs
       - keras-applications:/root/.keras/
+    environment:
+      KERAS_TUNER_ID: '{{.Node.ID}}'
     deploy:
       mode: global
+      endpoint_mode: dnsrr
       resources:
         reservations:
           devices:
@@ -41,6 +45,46 @@ services:
         hard: 67108864
     shm_size: 1g
     privileged: true
+    links:
+      - chief
+  chief:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python3 src/Pretrained.py --sample_rate 16000
+    volumes:
+      - cs5661-data:/workspace/output
+      - cs5661-hp_tuning:/workspace/hyper_parameter_tuning
+      - cs5661-logs:/workspace/logs
+      - keras-applications:/root/.keras/
+    environment:
+      KERAS_TUNER_ID: chief
+      KERASTUNER_ORACLE_IP="chief"
+      KERASTUNER_ORACLE_PORT="8000"
+    deploy:
+      mode: global
+      endpoint_mode: dnsrr
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: on-failure
+    depends_on:
+      preprocess:
+       condition: service_completed_successfully
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack:
+        soft: 67108864
+        hard: 67108864
+    shm_size: 1g
+    privileged: true
+    links:
+      - tuner
   tensorboard:
     image: tensorflow/tensorflow:latest
     command: tensorboard --logdir=/workspace/logs --bind_all
